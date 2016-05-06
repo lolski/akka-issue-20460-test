@@ -31,7 +31,8 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
   private implicit val context = system.dispatcher
 
   private val userAgentIPhone6Plus = "Mozilla/5.0 (iPhone; CPU iPhone OS 8_0 like Mac OS X) AppleWebKit/600.1.3 (KHTML, like Gecko) Version/8.0 Mobile/12A4345d Safari/600.1.4"
-  private val baseDomain = "www.medscape.com"
+  private val baseDomain = "www.zerobin.net"
+//  private val baseDomain = "www.medscape.com"
   private val baseWebUrl = "http://www.medscape.com"
 
   private val decider: Decider = {
@@ -91,9 +92,11 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
     val headers = imSeq(Referer("https://www.google.com/"))
     val newsId2 = 862562L
 
-    val request = HttpRequest(uri = getNewsPathPrint(newsId2)).withHeaders(headers)
+//    val url = getNewsPathPrint(newsId2)
+    val url = "/tos.html"
+    val request = HttpRequest(uri = url).withHeaders(headers)
 
-    val sequence: Future[imSeq[(Try[HttpResponse], Long)]] = Future.sequence((1 until 10).map { index =>
+    val sequence: Future[imSeq[(Try[HttpResponse], Long)]] = Future.sequence((1 to 10).map { index =>
       sendQueuedRequest(request, index.toLong)
     })
 
@@ -127,45 +130,59 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
 
   private def getNewsPathPrint(newsId: Long): String = s"/viewarticle/${newsId}_print"
 
-  private def parseResponse[TR](response: Future[(Try[HttpResponse], RequestContext)], redirectCount: Int = 0)(implicit unmarshaller: FromEntityUnmarshaller[TR]): Future[TR] =
-    response.flatMap { case (tryResp, reqContext) =>
+  private def parseResponse[TR](response: Future[(Try[HttpResponse], RequestContext)], redirectCount: Int = 0)(implicit unmarshaller: FromEntityUnmarshaller[TR]): Future[TR] = {
 
-      tryResp match {
-        case Success(res) =>
-          res.status match {
-            case OK =>
-              unmarshaller(res.entity).recoverWith {
-                case ex =>
-                  Unmarshal(res.entity).to[String].flatMap { body =>
-                    Future.failed(new IOException(s"Failed to unmarshal with ${ex.getMessage} and response body is\n $body"))
-                  }
-              }
-            case Found =>
-              res.header[Location] match {
-                case Some(value) =>
-                  if (redirectCount > 1)
-                    Future.failed(throw new RuntimeException(s"Possible redirect loop? Redirect count is $redirectCount. Location is ${value.uri.toString()}"))
-                  else {
-                    val newCookies = res.headers.filter(_.isInstanceOf[`Set-Cookie`]).map { v =>
-                      val cookie = v.asInstanceOf[`Set-Cookie`].cookie
-                      HttpCookiePair.apply(cookie.name, cookie.value)
-                    }
-                    parseResponse(sendQueuedRequest(HttpRequest(uri = value.uri.toRelative).withHeaders(imSeq(Cookie(newCookies))), reqContext), redirectCount + 1)(unmarshaller)
-                  }
-
-                case None =>
-                  Future.failed(new IOException(s"Got HTTP 302 response but Location header is missing"))
-              }
-            case _ =>
-              Unmarshal(res.entity).to[String].flatMap { body =>
-                Future.failed(new IOException(s"The response status is ${res.status} and response body is $body"))
-              }
+    def handleRedirect(resp: HttpResponse, reqContext: RequestContext): Future[TR] = {
+      resp.header[Location] match {
+        case Some(value) =>
+          if (redirectCount > 1)
+            Future.failed(throw new RuntimeException(s"Possible redirect loop? Redirect count is $redirectCount. Location is ${value.uri.toString()}"))
+          else {
+            val newCookies = resp.headers.filter(_.isInstanceOf[`Set-Cookie`]).map { v =>
+              val cookie = v.asInstanceOf[`Set-Cookie`].cookie
+              HttpCookiePair.apply(cookie.name, cookie.value)
+            }
+            parseResponse(sendQueuedRequest(HttpRequest(uri = value.uri.toRelative).withHeaders(imSeq(Cookie(newCookies))), reqContext), redirectCount + 1)(unmarshaller)
           }
-        case Failure(ex) =>
-          Future.failed(ex)
+
+        case None =>
+          Future.failed(new IOException(s"Got HTTP 302 response but Location header is missing"))
       }
     }
 
+    response.flatMap {
+      case (tryResp, reqContext) =>
+
+        tryResp match {
+          case Success(res) =>
+            res.status match {
+              case OK =>
+                val fut = unmarshaller(res.entity).recoverWith {
+                  case ex =>
+                    Unmarshal(res.entity).to[String].flatMap { body =>
+                      Future.failed(new IOException(s"Failed to unmarshal with ${ex.getMessage} and response body is\n $body"))
+                    }
+                }
+                //              fut.map {case tr: TR =>
+                //                println("Exhausting response bytes")
+                //                res.entity.dataBytes.runWith(Sink.ignore)
+                //                tr
+                //              }
+                fut
+              case Found =>
+                handleRedirect(res, reqContext)
+              case MovedPermanently =>
+                handleRedirect(res, reqContext)
+              case _ =>
+                Unmarshal(res.entity).to[String].flatMap { body =>
+                  Future.failed(new IOException(s"The response status is ${res.status} and response body is $body"))
+                }
+            }
+          case Failure(ex) =>
+            Future.failed(ex)
+        }
+    }
+  }
   def main(args: Array[String]): Unit = {
 
     testCall2().onComplete {

@@ -1,0 +1,50 @@
+<configuration>
+    <appender name="console" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS Z} %-5level %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <appender name="SIFT" class="ch.qos.logback.classic.sift.SiftingAppender">
+        <!-- in the absence of the class attribute, it is assumed that the
+             desired discriminator type is
+             ch.qos.logback.classic.sift.MDCBasedDiscriminator -->
+        <discriminator>
+            <key>customerid</key>
+            <defaultValue>unauthenticated</defaultValue>
+        </discriminator>
+        <sift>
+            <appender name="FILE-${customerid}" class="ch.qos.logback.core.rolling.RollingFileAppender">
+                <file>customer_${customerid}.log</file>
+                <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+                    <!-- daily rollover -->
+                    <fileNamePattern>customer_${customerid}.%d{yyyy-MM-dd}.log</fileNamePattern>
+                    <!-- keep 30 days' worth of history -->
+                    <maxHistory>30</maxHistory>
+                </rollingPolicy>
+                <!--<append>true</append>-->
+                <encoder>
+                    <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS Z} %-5level %msg%n</pattern>
+                </encoder>
+            </appender>
+        </sift>
+    </appender>
+
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <append>true</append>
+        <file>medstream-server.log</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+            <fileNamePattern>medstream-server-%d{yyyy-MM-dd}.log.zip</fileNamePattern>
+            <maxHistory>30</maxHistory>
+        </rollingPolicy>
+
+        <encoder>
+            <pattern>%date{YYYY-MM-dd HH:mm:ss.SSS Z} %-5level %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="console"/>
+        <appender-ref ref="FILE"/>
+    </root>
+</configuration>

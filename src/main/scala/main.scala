@@ -32,8 +32,7 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
 
   private val userAgentIPhone6Plus = "Mozilla/5.0 (iPhone; CPU iPhone OS 8_0 like Mac OS X) AppleWebKit/600.1.3 (KHTML, like Gecko) Version/8.0 Mobile/12A4345d Safari/600.1.4"
   private val baseDomain = "www.zerobin.net"
-//  private val baseDomain = "www.medscape.com"
-  private val baseWebUrl = "http://www.medscape.com"
+  private val baseWebUrl = "http://www.zerobin.net"
 
   private val decider: Decider = {
     case ex =>
@@ -157,18 +156,12 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
           case Success(res) =>
             res.status match {
               case OK =>
-                val fut = unmarshaller(res.entity).recoverWith {
+                unmarshaller(res.entity).recoverWith {
                   case ex =>
                     Unmarshal(res.entity).to[String].flatMap { body =>
                       Future.failed(new IOException(s"Failed to unmarshal with ${ex.getMessage} and response body is\n $body"))
                     }
                 }
-                //              fut.map {case tr: TR =>
-                //                println("Exhausting response bytes")
-                //                res.entity.dataBytes.runWith(Sink.ignore)
-                //                tr
-                //              }
-                fut
               case Found =>
                 handleRedirect(res, reqContext)
               case MovedPermanently =>

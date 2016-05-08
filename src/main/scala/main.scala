@@ -1,6 +1,8 @@
 import java.io.{ByteArrayInputStream, IOException}
+import java.util.concurrent.TimeUnit
 
 import akka.actor.ActorSystem
+import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.model.MediaTypes._
 import akka.http.scaladsl.model.StatusCodes._
@@ -8,7 +10,6 @@ import akka.http.scaladsl.model.headers.{Cookie, HttpCookiePair, Location, Refer
 import akka.http.scaladsl.model.{HttpRequest, HttpResponse}
 import akka.http.scaladsl.settings.ConnectionPoolSettings
 import akka.http.scaladsl.unmarshalling.{Unmarshal, _}
-import akka.http.scaladsl.{Http, HttpExt}
 import akka.stream.Supervision._
 import akka.stream.scaladsl.{Keep, Sink, Source}
 import akka.stream.{ActorMaterializer, ActorMaterializerSettings, OverflowStrategy, QueueOfferResult, Supervision}
@@ -19,7 +20,7 @@ import org.jsoup.nodes.{Document => jsDocument, Element => jsElement}
 import spray.json._
 
 import scala.collection.immutable.{Seq => imSeq}
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration._
 import scala.concurrent.{Await, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
@@ -43,41 +44,52 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
 
   private implicit val materializer = ActorMaterializer(ActorMaterializerSettings(system).withSupervisionStrategy(decider))(system)
   private val poolClientFlow = initialize()
+
   private val queue = Source.queue[(HttpRequest, (Any, Promise[(Try[HttpResponse], Any)]))](1000, OverflowStrategy.backpressure)
-    .via(poolClientFlow)
-    .toMat(Sink.foreach({
-      case (triedResp, (value: Any, p: Promise[(Try[HttpResponse], Any)])) =>
-        println(s"Response was received ${value.toString}")
-        val x = triedResp.get.entity.dataBytes.toMat(Sink.seq)(Keep.right).run() // consume dataBytes, which is also a source
-        x map { e => p.success(triedResp -> value); println(s"Received ${e.length} bytes for ID ${value.toString}" ) }
-//        p.success(triedResp -> value)
-      case _ =>
-        throw new RuntimeException()
-    }))(Keep.left)
-    .run
+  private val sink = Sink.foreach[(Try[HttpResponse], Any)] {
+    case (triedResp, (index: Long, p: Promise[(Try[HttpResponse], Any)])) =>
+      println(s"Response was received $index")
+      p.success(triedResp -> index)
+
+      val marsh = jsoupHtmlUnmarshaller(baseWebUrl + getNewsPathPrint(index))
+      val rc = RequestContext(index, index)
+      val qwe: Future[jsDocument] = parseResponse[jsDocument](Future.successful(triedResp -> rc))(marsh)
+      qwe.map { newsHtml =>
+        println(s"Got ${newsHtml.toString.length} characters in html for index $index")
+      } recover { case t: Throwable =>
+        println(s"Error parsing ${t.getMessage} for index $index")
+      }
+
+    case (triedResp, (value @ RequestContext(catId, newsId), p: Promise[(Try[HttpResponse], Any)])) =>
+      println(s"Response was received ${value.toString}")
+
+      p.success(triedResp -> value)
+
+    case _ =>
+      throw new RuntimeException()
+  }
+
+  private val pipeline = queue.via(poolClientFlow).toMat(sink)(Keep.left).run
 
   private def initialize() = {
-
     val defaultSettings = ConnectionPoolSettings(config)
-    val newSettings = defaultSettings
-//      .withPipeliningLimit(16)
-//      .withMaxRetries(0)
-//      .withMaxConnections(4)
+    val newSettings = defaultSettings.
+      withPipeliningLimit(16).
+      withMaxRetries(0).
+      withMaxConnections(4)
 
     val connectionSettings = newSettings.connectionSettings
       .withUserAgentHeader(Option(`User-Agent`(userAgentIPhone6Plus)))
-//      .withConnectingTimeout(FiniteDuration(1, TimeUnit.SECONDS))
+      .withConnectingTimeout(FiniteDuration(1, TimeUnit.SECONDS))
 
     val finalSettings = newSettings.withConnectionSettings(connectionSettings)
 
-    val http: HttpExt = Http()(system)
-    http.cachedHostConnectionPoolHttps[Any](baseDomain, 443, http.defaultClientHttpsContext, finalSettings)
+    Http()(system).cachedHostConnectionPool[Any](baseDomain, 80, finalSettings)
   }
 
   def sendQueuedRequest[T](request: HttpRequest, param: T): Future[(Try[HttpResponse], T)] = {
-
     val promise = Promise[(Try[HttpResponse], Any)]
-    queue.offer(request -> (param -> promise)).flatMap {
+    pipeline.offer(request -> (param -> promise)) flatMap {
       case QueueOfferResult.Enqueued =>
         println(s"Request enqueued ${param.toString}")
         promise.future.map { case (resp, value) => resp -> value.asInstanceOf[T] }
@@ -86,38 +98,6 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
       case v =>
         Future.failed(new RuntimeException(s"${v.toString} returned as QueueOfferResult"))
     }
-  }
-
-  def testCall2() = {
-
-    val headers = imSeq(Referer("https://www.google.com/"))
-    val newsId2 = 862562L
-
-//    val url = getNewsPathPrint(newsId2)
-    val url = "/tos.html"
-    val request = HttpRequest(uri = url).withHeaders(headers)
-
-    val sequence: Future[imSeq[(Try[HttpResponse], Long)]] = Future.sequence((1 to 10).map { index =>
-      sendQueuedRequest(request, index.toLong)
-    })
-
-    val qwe = sequence.map { case responses =>
-
-      println(s"Got ${responses.length} responses")
-
-      Future.sequence(responses.map { case (tryResp, index: Long) =>
-
-        println(s"Parsing items ID $index")
-        val marsh = jsoupHtmlUnmarshaller(baseWebUrl + getNewsPathPrint(index))
-        val rc = RequestContext(index, index)
-        val qwe: Future[jsDocument] = parseResponse[jsDocument](Future.successful(tryResp -> rc))(marsh)
-        qwe.map { newsHtml =>
-          println(s"Got ${newsHtml.toString.length} characters in html for index $index")
-        }
-      })
-    }
-
-    qwe.flatMap(identity)
   }
 
   def jsoupHtmlUnmarshaller(reqUrl: String): FromEntityUnmarshaller[jsDocument] =
@@ -143,36 +123,35 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
               val cookie = v.asInstanceOf[`Set-Cookie`].cookie
               HttpCookiePair.apply(cookie.name, cookie.value)
             }
-            println(s"Redirecting to ${value.uri.toRelative}")
-            val plainRequest = HttpRequest(uri = value.uri.toRelative)
-            val request = if (newCookies.nonEmpty) plainRequest.withHeaders(imSeq(Cookie(newCookies))) else plainRequest
-            parseResponse(sendQueuedRequest(request, reqContext), redirectCount + 1)(unmarshaller)
+            parseResponse(sendQueuedRequest(HttpRequest(uri = value.uri.toRelative).withHeaders(imSeq(Cookie(newCookies))), reqContext), redirectCount + 1)(unmarshaller)
           }
 
         case None =>
           Future.failed(new IOException(s"Got HTTP 302 response but Location header is missing"))
       }
     }
-
+    println("parse response ")
     response.flatMap {
       case (tryResp, reqContext) =>
-
         tryResp match {
           case Success(res) =>
+            val en = Await.result(res.entity.toStrict(10 seconds), 10 seconds)
+
             res.status match {
               case OK =>
-                unmarshaller(res.entity).recoverWith {
+                val x = unmarshaller(en).recoverWith {
                   case ex =>
-                    Unmarshal(res.entity).to[String].flatMap { body =>
+                    Unmarshal(en).to[String].flatMap { body =>
                       Future.failed(new IOException(s"Failed to unmarshal with ${ex.getMessage} and response body is\n $body"))
                     }
                 }
+                x
               case Found =>
                 handleRedirect(res, reqContext)
               case MovedPermanently =>
                 handleRedirect(res, reqContext)
               case _ =>
-                Unmarshal(res.entity).to[String].flatMap { body =>
+                Unmarshal(en).to[String].flatMap { body =>
                   Future.failed(new IOException(s"The response status is ${res.status} and response body is $body"))
                 }
             }
@@ -182,15 +161,21 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
     }
   }
   def main(args: Array[String]): Unit = {
+    val headers = imSeq(Referer("https://www.google.com/"))
+    val url = "/tos.html"
+    val request = HttpRequest(uri = url).withHeaders(headers)
 
-    testCall2().onComplete {
+    val requests = (1 to 10) map { index => sendQueuedRequest(request, index.toLong) }
+    val join = Future.sequence(requests)
+    join onSuccess { case _ => pipeline.complete() }
+    join onFailure { case t => pipeline.fail(t) }
+
+    pipeline.watchCompletion().onComplete {
       case Success(res) =>
-        println(">>>>>>>>>>>> ", res)
-
+        println("done (successful)" + res)
         system.terminate()
       case Failure(ex) =>
         ex.printStackTrace()
-
         system.terminate()
     }
 

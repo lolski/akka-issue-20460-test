@@ -1,8 +1,6 @@
 import java.io.{ByteArrayInputStream, IOException}
-import java.util.concurrent.TimeUnit
 
 import akka.actor.ActorSystem
-import akka.http.scaladsl.Http
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport
 import akka.http.scaladsl.model.MediaTypes._
 import akka.http.scaladsl.model.StatusCodes._
@@ -10,6 +8,7 @@ import akka.http.scaladsl.model.headers.{Cookie, HttpCookiePair, Location, Refer
 import akka.http.scaladsl.model.{HttpRequest, HttpResponse}
 import akka.http.scaladsl.settings.ConnectionPoolSettings
 import akka.http.scaladsl.unmarshalling.{Unmarshal, _}
+import akka.http.scaladsl.{Http, HttpExt}
 import akka.stream.Supervision._
 import akka.stream.scaladsl.{Keep, Sink, Source}
 import akka.stream.{ActorMaterializer, ActorMaterializerSettings, OverflowStrategy, QueueOfferResult, Supervision}
@@ -20,7 +19,7 @@ import org.jsoup.nodes.{Document => jsDocument, Element => jsElement}
 import spray.json._
 
 import scala.collection.immutable.{Seq => imSeq}
-import scala.concurrent.duration.{Duration, FiniteDuration}
+import scala.concurrent.duration.Duration
 import scala.concurrent.{Await, Future, Promise}
 import scala.util.{Failure, Success, Try}
 
@@ -49,7 +48,9 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
     .toMat(Sink.foreach({
       case (triedResp, (value: Any, p: Promise[(Try[HttpResponse], Any)])) =>
         println(s"Response was received ${value.toString}")
-        p.success(triedResp -> value)
+        val x = triedResp.get.entity.dataBytes.toMat(Sink.seq)(Keep.right).run() // consume dataBytes, which is also a source
+        x map { e => p.success(triedResp -> value); println(s"Received ${e.length} bytes for ID ${value.toString}" ) }
+//        p.success(triedResp -> value)
       case _ =>
         throw new RuntimeException()
     }))(Keep.left)
@@ -58,18 +59,19 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
   private def initialize() = {
 
     val defaultSettings = ConnectionPoolSettings(config)
-    val newSettings = defaultSettings.
-      withPipeliningLimit(16).
-      withMaxRetries(0).
-      withMaxConnections(4)
+    val newSettings = defaultSettings
+//      .withPipeliningLimit(16)
+//      .withMaxRetries(0)
+//      .withMaxConnections(4)
 
     val connectionSettings = newSettings.connectionSettings
       .withUserAgentHeader(Option(`User-Agent`(userAgentIPhone6Plus)))
-      .withConnectingTimeout(FiniteDuration(1, TimeUnit.SECONDS))
+//      .withConnectingTimeout(FiniteDuration(1, TimeUnit.SECONDS))
 
     val finalSettings = newSettings.withConnectionSettings(connectionSettings)
 
-    Http()(system).cachedHostConnectionPool[Any](baseDomain, 80, finalSettings)
+    val http: HttpExt = Http()(system)
+    http.cachedHostConnectionPoolHttps[Any](baseDomain, 443, http.defaultClientHttpsContext, finalSettings)
   }
 
   def sendQueuedRequest[T](request: HttpRequest, param: T): Future[(Try[HttpResponse], T)] = {
@@ -141,7 +143,10 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
               val cookie = v.asInstanceOf[`Set-Cookie`].cookie
               HttpCookiePair.apply(cookie.name, cookie.value)
             }
-            parseResponse(sendQueuedRequest(HttpRequest(uri = value.uri.toRelative).withHeaders(imSeq(Cookie(newCookies))), reqContext), redirectCount + 1)(unmarshaller)
+            println(s"Redirecting to ${value.uri.toRelative}")
+            val plainRequest = HttpRequest(uri = value.uri.toRelative)
+            val request = if (newCookies.nonEmpty) plainRequest.withHeaders(imSeq(Cookie(newCookies))) else plainRequest
+            parseResponse(sendQueuedRequest(request, reqContext), redirectCount + 1)(unmarshaller)
           }
 
         case None =>
@@ -180,7 +185,7 @@ object main extends SprayJsonSupport with DefaultJsonProtocol with LazyLogging {
 
     testCall2().onComplete {
       case Success(res) =>
-        println(res)
+        println(">>>>>>>>>>>> ", res)
 
         system.terminate()
       case Failure(ex) =>
